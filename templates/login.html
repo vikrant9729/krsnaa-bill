@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Login - Medical Billing System{% endblock %}
+{% block content %}
+<div class="container mt-5" style="max-width: 400px;">
+    <div class="card text-center">
+        <img src="{{ url_for('static', filename='rpl-logo.png') }}" alt="Logo" style="height:60px; width:auto; margin: 30px auto 10px auto;">
+        <div class="card-header bg-success text-white text-center d-flex flex-column align-items-center">
+            <div class="rounded-circle bg-light d-flex align-items-center justify-content-center mb-2" style="width:56px; height:56px; font-size:2rem; color:#27ae60; border:2px solid #27ae60;">
+                <i class="fas fa-user"></i>
+            </div>
+            <h4 class="mb-0">Login</h4>
+        </div>
+        <div class="card-body">
+            <form method="post">
+                <div class="mb-3">
+                    <label for="identifier" class="form-label">Username or Email</label>
+                    <input type="text" class="form-control" id="identifier" name="identifier" required>
+                </div>
+                <div class="mb-3">
+                    <label for="password" class="form-label">Password</label>
+                    <input type="password" class="form-control" id="password" name="password" required>
+                </div>
+                <button type="submit" class="btn btn-success w-100">Login</button>
+            </form>
+            <div class="text-center mt-3">
+                <a href="{{ url_for('register') }}">Don't have an account? Register</a>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

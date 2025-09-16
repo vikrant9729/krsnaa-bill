@@ -1,3 +1,336 @@
+# --- Imports and App Initialization ---
+import os
+import logging
+from flask import Flask, render_template, request, redirect, url_for, flash, session, send_file, jsonify
+from functools import wraps
+# ...existing code...
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+app.secret_key = 'your-secret-key-here'
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+
+# --- Login Required Decorator ---
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            flash('Login required', 'error')
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+# --- Advanced Dashboard & Analytics Route ---
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    try:
+        # Filters
+        month = request.args.get('month')
+        category_name = request.args.get('category')
+        query = Bill.query
+        if month:
+            query = query.filter(Bill.month == month)
+        if category_name:
+            category = BillCategory.query.filter_by(name=category_name).first()
+            if category:
+                query = query.filter(Bill.category_id == category.id)
+        bills_db = query.all()
+        bills = [b.bill_data for b in bills_db]
+
+        # --- Metrics ---
+        total_revenue = sum(b.get('total_rate', 0) for b in bills)
+        total_outstanding = sum(
+            b.get('total_rate', 0) - sum(b.get('payment_details', {}).values())
+            if b.get('payment_details') else b.get('total_rate', 0)
+            for b in bills
+        )
+        num_bills = len(bills)
+        # Top center this month
+        top_center = None
+        if bills:
+            center_totals = {}
+            for b in bills:
+                center = b.get('centre_name')
+                center_totals[center] = center_totals.get(center, 0) + b.get('total_rate', 0)
+            top_center = max(center_totals, key=center_totals.get)
+
+        # --- Monthly Billing Trend ---
+        # Group by month (YYYY-MM)
+        from collections import defaultdict
+        monthly_trend = defaultdict(float)
+        for b in Bill.query.all():
+            m = b.month
+            monthly_trend[m] += b.bill_data.get('total_rate', 0)
+        monthly_trend = sorted(monthly_trend.items())
+
+        # --- Top 5 Centers ---
+        center_totals = defaultdict(float)
+        for b in bills:
+            center = b.get('centre_name')
+            center_totals[center] += b.get('total_rate', 0)
+        top_centers = sorted(center_totals.items(), key=lambda x: x[1], reverse=True)[:5]
+
+        # --- Category Distribution ---
+        category_totals = defaultdict(float)
+        for b in bills_db:
+            cat = b.category.name if b.category else 'Unknown'
+            category_totals[cat] += b.bill_data.get('total_rate', 0)
+        category_dist = sorted(category_totals.items())
+
+        # --- Outstanding vs Paid ---
+        paid = sum(
+            sum(b.get('payment_details', {}).values())
+            if b.get('payment_details') else 0
+            for b in bills
+        )
+        outstanding = total_revenue - paid
+
+        return render_template(
+            'dashboard.html',
+            total_revenue=total_revenue,
+            total_outstanding=total_outstanding,
+            num_bills=num_bills,
+            top_center=top_center,
+            monthly_trend=monthly_trend,
+            top_centers=top_centers,
+            category_dist=category_dist,
+            paid=paid,
+            outstanding=outstanding,
+            app=app
+        )
+    except Exception as e:
+        logger.error(f"Error in dashboard route: {e}")
+        flash('An error occurred while loading dashboard', 'error')
+        return redirect(url_for('index'))
+# --- Audit Logs Route (admin only) ---
+# (Route is defined after permission decorators below)
+from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for, flash, session
+import pandas as pd
+import os
+from datetime import datetime
+import json
+from werkzeug.utils import secure_filename
+import tempfile
+import zipfile
+from io import BytesIO
+import logging
+import requests
+from dotenv import load_dotenv
+import re
+from utils import AmountToWords, InvoiceNumberGenerator, AIIntegration, safe_float_conversion, safe_int_conversion, safe_date_conversion
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+# SQLAlchemy/PostgreSQL imports
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import func
+from openpyxl.cell import MergedCell
+from utils_auth import hash_password, verify_password
+from utils_email import send_email_with_attachment
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+app.secret_key = 'your-secret-key-here'
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+
+# SQLAlchemy/PostgreSQL config
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/billing_db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+# Ensure upload folder exists
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+ALLOWED_EXTENSIONS = {'xlsx', 'xls', 'xlsm'}
+
+# Initialize global objects
+amount_converter = AmountToWords()
+invoice_generator = InvoiceNumberGenerator()
+ai_integration = AIIntegration()
+
+# --- Update Bill Payment Info ---
+@app.route('/bill/<int:bill_index>/update_payment', methods=['POST'])
+def update_bill_payment(bill_index):
+    try:
+        if not hasattr(app, 'bills') or not app.bills:
+            flash('No bills available', 'error')
+            return redirect(url_for('bills'))
+        if bill_index < 0 or bill_index >= len(app.bills):
+            flash('Bill not found', 'error')
+            return redirect(url_for('bills'))
+
+        # Get payment info from form
+        payment_mode = request.form.get('payment_mode')
+        payment_methods = request.form.getlist('payment_method[]')
+        payment_amounts = request.form.getlist('payment_amount[]')
+        payment_details = {}
+        for method, amount in zip(payment_methods, payment_amounts):
+            if method and amount:
+                try:
+                    payment_details[method] = float(amount)
+                except Exception:
+                    continue
+
+        # Update in DB (assume Bill model is in DB, not just app.bills)
+        bill_obj = Bill.query.filter_by(bill_number=app.bills[bill_index]['bill_number']).first()
+        if bill_obj:
+            bill_obj.payment_mode = payment_mode
+            bill_obj.payment_details = payment_details
+            db.session.commit()
+            # Update in-memory bill if needed
+            app.bills[bill_index]['payment_mode'] = payment_mode
+            app.bills[bill_index]['payment_details'] = payment_details
+            flash('Payment info updated.', 'success')
+        else:
+            flash('Bill not found in database.', 'error')
+        return redirect(url_for('view_bill', bill_index=bill_index))
+    except Exception as e:
+        logger.error(f"Error in update_bill_payment: {e}")
+        flash('An error occurred while updating payment info', 'error')
+        return redirect(url_for('view_bill', bill_index=bill_index))
+# Load environment variables
+from utils_auth import hash_password, verify_password
+from flask import session
+# --- User Registration Route ---
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        email = request.form.get('email')
+        password = request.form.get('password')
+        role = request.form.get('role', 'staff')
+        if not username or not email or not password:
+            flash('All fields are required', 'error')
+            return render_template('register.html')
+        if User.query.filter((User.username == username) | (User.email == email)).first():
+            flash('Username or email already exists', 'error')
+            return render_template('register.html')
+        user = User(
+            username=username,
+            email=email,
+            password_hash=hash_password(password),
+            role=role
+        )
+        db.session.add(user)
+        db.session.commit()
+        flash('Registration successful. Please log in.', 'success')
+        return redirect(url_for('login'))
+    return render_template('register.html')
+
+# --- User Login Route ---
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        identifier = request.form.get('identifier')  # username or email
+        password = request.form.get('password')
+        user = User.query.filter((User.username == identifier) | (User.email == identifier)).first()
+        if user and verify_password(user.password_hash, password):
+            session['user_id'] = user.id
+            session['username'] = user.username
+            session['role'] = user.role
+            flash('Login successful', 'success')
+            return redirect(url_for('index'))
+        else:
+            flash('Invalid credentials', 'error')
+    return render_template('login.html')
+
+# --- User Logout Route ---
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash('Logged out successfully', 'success')
+    return redirect(url_for('login'))
+# Load environment variables
+from utils_email import send_email_with_attachment
+# --- Email Bill Endpoint ---
+@app.route('/email_bill/<int:bill_index>', methods=['POST'])
+def email_bill(bill_index):
+    try:
+        if not hasattr(app, 'bills') or not app.bills:
+            flash('No bills available', 'error')
+            return redirect(url_for('bills'))
+        if bill_index < 0 or bill_index >= len(app.bills):
+            flash('Bill not found', 'error')
+            return redirect(url_for('bills'))
+
+        bill = app.bills[bill_index]
+        fmt = request.form.get('format', 'pdf').lower()
+        email_to = request.form.get('email_to')
+        smtp_provider = request.form.get('smtp_provider', 'gmail')
+        if not email_to:
+            flash('Recipient email required', 'error')
+            return redirect(url_for('view_bill', bill_index=bill_index))
+
+        # Prepare attachment
+        safe_center_name = str(bill['centre_name']).replace(" ", "_").replace("/", "_")
+        subject = f"Bill {bill['bill_number']} - {bill['centre_name']}"
+        body = f"Please find attached the bill {bill['bill_number']} for {bill['centre_name']}."
+        attachment_bytes = None
+        attachment_filename = None
+        if fmt == 'excel':
+            if bill.get("center_type") == "HLM":
+                excel_path = generate_hlm_excel_from_template(bill, bill.get('center_rows_data', []))
+                with open(excel_path, 'rb') as f:
+                    attachment_bytes = f.read()
+                attachment_filename = f"{safe_center_name}.xlsm"
+            else:
+                import pandas as pd
+                from io import BytesIO
+                buffer = BytesIO()
+                df = pd.DataFrame(bill['test_items'])
+                df.to_excel(buffer, index=False)
+                buffer.seek(0)
+                attachment_bytes = buffer.read()
+                attachment_filename = f"{safe_center_name}.xlsx"
+        elif fmt == 'pdf':
+            html_content = render_template('bill_pdf.html', bill=bill)
+            from io import BytesIO
+            pdf_buffer = BytesIO()
+            try:
+                import pdfkit
+                pdf = pdfkit.from_string(html_content, False)
+                pdf_buffer.write(pdf)
+            except Exception:
+                from xhtml2pdf import pisa
+                pisa_status = pisa.CreatePDF(html_content, dest=pdf_buffer)
+                if pisa_status.err:
+                    flash('PDF generation failed', 'error')
+                    return redirect(url_for('view_bill', bill_index=bill_index))
+            pdf_buffer.seek(0)
+            attachment_bytes = pdf_buffer.read()
+            attachment_filename = f"{safe_center_name}.pdf"
+        else:
+            html_content = render_template('bill_pdf.html', bill=bill)
+            attachment_bytes = html_content.encode('utf-8')
+            attachment_filename = f"{safe_center_name}.html"
+
+        send_email_with_attachment(
+            subject=subject,
+            body=body,
+            to_emails=[email_to],
+            attachment_bytes=attachment_bytes,
+            attachment_filename=attachment_filename,
+            smtp_provider=smtp_provider
+        )
+        flash(f'Bill emailed to {email_to} via {smtp_provider}', 'success')
+        return redirect(url_for('view_bill', bill_index=bill_index))
+    except Exception as e:
+        logger.error(f"Error in email_bill: {e}")
+        flash('An error occurred while emailing the bill', 'error')
+        return redirect(url_for('view_bill', bill_index=bill_index))
+# Load environment variables
 from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for, flash
 import pandas as pd
 import os
@@ -27,6 +360,126 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+app = Flask(__name__)
+app.secret_key = 'your-secret-key-here'
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+
+# SQLAlchemy/PostgreSQL config
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/billing_db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+# Ensure upload folder exists
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+ALLOWED_EXTENSIONS = {'xlsx', 'xls', 'xlsm'}
+
+# Initialize global objects
+amount_converter = AmountToWords()
+invoice_generator = InvoiceNumberGenerator()
+ai_integration = AIIntegration()
+
+# --- Database Models ---
+class BillCategory(db.Model):
+    __tablename__ = 'bill_categories'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(64), unique=True, nullable=False)
+    description = db.Column(db.String(256))
+    bills = db.relationship('Bill', backref='category', lazy=True)
+
+class UploadedFile(db.Model):
+    __tablename__ = 'uploaded_files'
+    id = db.Column(db.Integer, primary_key=True)
+    filename = db.Column(db.String(256), nullable=False)
+    upload_time = db.Column(db.DateTime, default=datetime.utcnow)
+    file_path = db.Column(db.String(512), nullable=False)
+    bills = db.relationship('Bill', backref='uploaded_file', lazy=True)
+
+class Bill(db.Model):
+    __tablename__ = 'bills'
+    id = db.Column(db.Integer, primary_key=True)
+    bill_number = db.Column(db.String(64), unique=True, nullable=False)
+    center_name = db.Column(db.String(128), nullable=False)
+    month = db.Column(db.String(16), nullable=False)  # e.g. '2025-08'
+    category_id = db.Column(db.Integer, db.ForeignKey('bill_categories.id'), nullable=False)
+    uploaded_file_id = db.Column(db.Integer, db.ForeignKey('uploaded_files.id'), nullable=True)
+    bill_data = db.Column(db.JSON, nullable=False)  # Store bill details as JSON
+    status = db.Column(db.String(20), nullable=False, default='pending')  # pending, paid, rejected, in_review, cancelled
+    payment_mode = db.Column(db.String(50), nullable=True)  # cash, phonepay, mobivik, hdfc_ac, yesbank_ac, manglam, card, etc.
+    payment_details = db.Column(db.JSON, nullable=True)  # breakdown: {"manglam": 1000, "hdfc_ac": 500, ...}
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f'<Bill {self.bill_number} - {self.center_name}>'
+
+class User(db.Model):
+    __tablename__ = 'users'
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(64), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(128), nullable=False)
+    role = db.Column(db.String(16), nullable=False, default='staff')  # 'admin' or 'staff'
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    can_edit_bills = db.Column(db.Boolean, default=False)
+    can_delete_bills = db.Column(db.Boolean, default=False)
+
+    def __repr__(self):
+        return f'<User {self.username} ({self.role})>'
+
+from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for, flash
+import pandas as pd
+import os
+from datetime import datetime
+import json
+from werkzeug.utils import secure_filename
+import tempfile
+import zipfile
+from io import BytesIO
+import logging
+import requests
+from dotenv import load_dotenv
+import re
+from utils import AmountToWords, InvoiceNumberGenerator, AIIntegration, safe_float_conversion, safe_int_conversion, safe_date_conversion
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+# SQLAlchemy/PostgreSQL imports
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import func
+from openpyxl.cell import MergedCell
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+app.secret_key = 'your-secret-key-here'
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+
+# SQLAlchemy/PostgreSQL config
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/billing_db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+# Ensure upload folder exists
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+ALLOWED_EXTENSIONS = {'xlsx', 'xls', 'xlsm'}
+
+...
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.secret_key = 'your-secret-key-here'
@@ -54,6 +507,23 @@ class UploadedFile(db.Model):
     file_path = db.Column(db.String(512), nullable=False)
     bills = db.relationship('Bill', backref='uploaded_file', lazy=True)
 
+
+# --- Database Models ---
+class BillCategory(db.Model):
+    __tablename__ = 'bill_categories'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(64), unique=True, nullable=False)
+    description = db.Column(db.String(256))
+    bills = db.relationship('Bill', backref='category', lazy=True)
+
+class UploadedFile(db.Model):
+    __tablename__ = 'uploaded_files'
+    id = db.Column(db.Integer, primary_key=True)
+    filename = db.Column(db.String(256), nullable=False)
+    upload_time = db.Column(db.DateTime, default=datetime.utcnow)
+    file_path = db.Column(db.String(512), nullable=False)
+    bills = db.relationship('Bill', backref='uploaded_file', lazy=True)
+
 class Bill(db.Model):
     __tablename__ = 'bills'
     id = db.Column(db.Integer, primary_key=True)
@@ -63,10 +533,28 @@ class Bill(db.Model):
     category_id = db.Column(db.Integer, db.ForeignKey('bill_categories.id'), nullable=False)
     uploaded_file_id = db.Column(db.Integer, db.ForeignKey('uploaded_files.id'), nullable=True)
     bill_data = db.Column(db.JSON, nullable=False)  # Store bill details as JSON
+    status = db.Column(db.String(20), nullable=False, default='pending')  # pending, paid, rejected, in_review, cancelled
+    payment_mode = db.Column(db.String(50), nullable=True)  # cash, phonepay, mobivik, hdfc_ac, yesbank_ac, manglam, card, etc.
+    payment_details = db.Column(db.JSON, nullable=True)  # breakdown: {"manglam": 1000, "hdfc_ac": 500, ...}
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     def __repr__(self):
         return f'<Bill {self.bill_number} - {self.center_name}>'
+
+class User(db.Model):
+    __tablename__ = 'users'
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(64), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(128), nullable=False)
+    role = db.Column(db.String(16), nullable=False, default='staff')  # 'admin' or 'staff'
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    can_edit_bills = db.Column(db.Boolean, default=False)
+    can_delete_bills = db.Column(db.Boolean, default=False)
+
+    def __repr__(self):
+        return f'<User {self.username} ({self.role})>'
 from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for, flash
 import pandas as pd
 import os
@@ -295,18 +783,106 @@ def validate_excel_data(df):
 
 def process_excel_file(file_path):
     """Process Excel file and return billing data grouped by Center Name, with MobileNumber filtering."""
-    try:
-        df = pd.read_excel(file_path)
-        is_valid, error_msg = validate_excel_data(df)
-        if not is_valid:
-            return None, error_msg
-        df = df.fillna('')
-        # Store original df for later filtering
-        return df, None
-    except Exception as e:
-        logger.error(f"Error processing Excel file: {e}")
-        return None, f"Error processing file: {str(e)}"
 
+# --- Audit Log Model ---
+class AuditLog(db.Model):
+    __tablename__ = 'audit_logs'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    action = db.Column(db.String(64), nullable=False)
+    bill_id = db.Column(db.Integer, db.ForeignKey('bills.id'), nullable=True)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    details = db.Column(db.Text, nullable=True)
+
+    user = db.relationship('User', backref='audit_logs')
+    bill = db.relationship('Bill', backref='audit_logs')
+
+    def __repr__(self):
+        return f'<AuditLog {self.action} by {self.user_id} on {self.bill_id}>'
+from flask import abort
+# --- Helper: Permission Check Decorators ---
+
+# --- Audit Logs Route (admin only) ---
+# Place after permission check decorators so decorators are defined
+
+from functools import wraps
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            flash('Login required', 'error')
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if session.get('role') != 'admin':
+            flash('Admin access required', 'error')
+            return redirect(url_for('index'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def can_edit_bills_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        user = User.query.get(session.get('user_id'))
+        if not user or not (user.role == 'admin' or user.can_edit_bills):
+            flash('You do not have permission to edit bills', 'error')
+            return redirect(url_for('bills'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def can_delete_bills_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        user = User.query.get(session.get('user_id'))
+        if not user or not (user.role == 'admin' or user.can_delete_bills):
+            flash('You do not have permission to delete bills', 'error')
+            return redirect(url_for('bills'))
+        return f(*args, **kwargs)
+    return decorated_function
+# --- Edit Bill Endpoint ---
+@app.route('/bill/<int:bill_id>/edit', methods=['GET', 'POST'])
+@login_required
+@can_edit_bills_required
+def edit_bill(bill_id):
+    bill = Bill.query.get_or_404(bill_id)
+    if request.method == 'POST':
+        # Example: allow editing status and payment_mode only
+        status = request.form.get('status')
+        payment_mode = request.form.get('payment_mode')
+        if status:
+            bill.status = status
+        if payment_mode:
+            bill.payment_mode = payment_mode
+        db.session.commit()
+        # Audit log
+        log = AuditLog(user_id=session.get('user_id'), action='edit', bill_id=bill.id, details=f"Status: {status}, Payment mode: {payment_mode}")
+        db.session.add(log)
+        db.session.commit()
+        flash('Bill updated successfully', 'success')
+        return redirect(url_for('view_bill', bill_index=0))  # TODO: update to correct index logic
+    return render_template('edit_bill.html', bill=bill, app=app)
+
+# --- Delete Bill Endpoint ---
+@app.route('/bill/<int:bill_id>/delete', methods=['POST'])
+@login_required
+@can_delete_bills_required
+def delete_bill(bill_id):
+    bill = Bill.query.get_or_404(bill_id)
+    db.session.delete(bill)
+    db.session.commit()
+    # Audit log
+    log = AuditLog(user_id=session.get('user_id'), action='delete', bill_id=bill.id, details='Bill deleted')
+    db.session.add(log)
+    db.session.commit()
+    flash('Bill deleted successfully', 'success')
+    return redirect(url_for('bills'))
+
+    # ...existing code...
 def get_hlm_centers():
     """Get list of HLM centers"""
     hlm_centers = [
@@ -392,6 +968,13 @@ def upload_file():
             filename = secure_filename(file.filename)
             file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
             file.save(file_path)
+            # Upload to Google Drive (optional: set your folder ID)
+            try:
+                from utils_gdrive import upload_file_to_gdrive
+                gdrive_file_id = upload_file_to_gdrive(file_path, drive_folder_id=None)  # Set folder ID if needed
+                logger.info(f"Uploaded to Google Drive, file ID: {gdrive_file_id}")
+            except Exception as gdrive_exc:
+                logger.error(f"Google Drive upload failed: {gdrive_exc}")
         except Exception as e:
             logger.error(f"Error saving file: {e}")
             flash('Error saving uploaded file', 'error')
@@ -409,6 +992,11 @@ def upload_file():
         db.session.add(uploaded_file)
         db.session.commit()
         app.df = df
+        # --- Audit log for upload ---
+        user_id = session.get('user_id') if 'user_id' in session else None
+        log = AuditLog(user_id=user_id, action='upload', bill_id=None, details=f"Uploaded file: {filename}")
+        db.session.add(log)
+        db.session.commit()
         flash(f'Successfully uploaded {filename}', 'success')
         return redirect(url_for('index'))
     except Exception as e:
@@ -424,7 +1012,11 @@ def generate_all_bills():
         if not hasattr(app, 'bills') or not app.bills:
             flash('No bills available. Please upload an Excel file first.', 'error')
             return redirect(url_for('index'))
-        
+        # --- Audit log for bill generation ---
+        user_id = session.get('user_id') if 'user_id' in session else None
+        log = AuditLog(user_id=user_id, action='generate_all_bills', bill_id=None, details='Generated all bills')
+        db.session.add(log)
+        db.session.commit()
         flash('All bills generated successfully!', 'success')
         return redirect(url_for('bills'))
     except Exception as e:
@@ -456,6 +1048,11 @@ def generate_manual_bill():
             if selected_bill:
                 # Create a new bills list with only the selected bill
                 app.bills = [selected_bill]
+                # --- Audit log for manual bill generation ---
+                user_id = session.get('user_id') if 'user_id' in session else None
+                log = AuditLog(user_id=user_id, action='generate_manual_bill', bill_id=None, details=f'Generated manual bill for {center_name}')
+                db.session.add(log)
+                db.session.commit()
                 flash(f'Generated bill for {center_name}', 'success')
                 return redirect(url_for('bills'))
             else:
@@ -490,6 +1087,11 @@ def generate_multiple_bills():
                 return redirect(url_for('generate_multiple_bills'))
             
             app.bills = filtered_bills
+            # --- Audit log for multiple bill generation ---
+            user_id = session.get('user_id') if 'user_id' in session else None
+            log = AuditLog(user_id=user_id, action='generate_multiple_bills', bill_id=None, details=f'Generated {len(filtered_bills)} bills for selected centers')
+            db.session.add(log)
+            db.session.commit()
             flash(f'Generated {len(filtered_bills)} bills for selected centers', 'success')
             return redirect(url_for('bills'))
         
@@ -577,6 +1179,11 @@ def generate_hlm_bills():
             except Exception as e:
                 logger.error(f"Excel generation failed: {e}")
 
+            # --- Audit log for HLM bill generation ---
+            user_id = session.get('user_id') if 'user_id' in session else None
+            log = AuditLog(user_id=user_id, action='generate_hlm_bill', bill_id=None, details=f'Generated HLM bill for {selected_center}')
+            db.session.add(log)
+            db.session.commit()
             flash(f'Generated HLM bill for {selected_center}', 'success')
             return redirect(url_for('bills'))
 
@@ -658,6 +1265,11 @@ def generate_b2b_bills():
             flash('No B2B bills found in the uploaded data', 'error')
             return redirect(url_for('bills'))
         app.bills = bills
+        # --- Audit log for B2B bill generation ---
+        user_id = session.get('user_id') if 'user_id' in session else None
+        log = AuditLog(user_id=user_id, action='generate_b2b_bills', bill_id=None, details=f'Generated {len(bills)} B2B bills')
+        db.session.add(log)
+        db.session.commit()
         flash(f'Generated {len(bills)} B2B bills', 'success')
         return redirect(url_for('bills'))
     except Exception as e:
@@ -728,13 +1340,15 @@ def view_bill(bill_index):
         if not hasattr(app, 'bills') or not app.bills:
             flash('No bills available', 'error')
             return redirect(url_for('bills'))
-        
         if bill_index < 0 or bill_index >= len(app.bills):
             flash('Bill not found', 'error')
             return redirect(url_for('bills'))
-        
         bill = app.bills[bill_index]
-        return render_template('bill_detail.html', bill=bill, bill_index=bill_index, app=app)
+        # Get payment info from DB if available
+        bill_obj = Bill.query.filter_by(bill_number=bill['bill_number']).first()
+        payment_mode = bill_obj.payment_mode if bill_obj else None
+        payment_details = bill_obj.payment_details if bill_obj else None
+        return render_template('bill_detail.html', bill=bill, bill_index=bill_index, app=app, payment_mode=payment_mode, payment_details=payment_details)
     except Exception as e:
         logger.error(f"Error in view_bill: {e}")
         flash('An error occurred while viewing the bill', 'error')

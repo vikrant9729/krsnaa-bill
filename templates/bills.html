@@ -144,6 +144,18 @@
                         <div>
                             <h6 class="bill-number">{{ bill.bill_number if bill.bill_number else 'N/A' }}</h6>
                             <small class="text-muted">Center: {{ bill.centre_name if bill.centre_name else 'N/A' }}</small>
+                            {% if bill.status %}
+                            <span class="badge 
+                                {% if bill.status == 'paid' %}bg-success
+                                {% elif bill.status == 'pending' %}bg-warning text-dark
+                                {% elif bill.status == 'rejected' %}bg-danger
+                                {% elif bill.status == 'in_review' %}bg-info text-dark
+                                {% elif bill.status == 'cancelled' %}bg-secondary
+                                {% else %}bg-light text-dark
+                                {% endif %} ms-2">
+                                <i class="fas fa-circle me-1"></i>{{ bill.status|capitalize }}
+                            </span>
+                            {% endif %}
                         </div>
                         <span class="badge bg-primary">{{ bill.test_items|length if bill.test_items else 0 }} Tests</span>
                     </div>
@@ -169,12 +181,42 @@
                                 <small class="text-muted d-block">Sharing: {{ "%.2f"|format(bill.total_sharing) if bill.total_sharing is defined else 0.00 }}</small>
                             </div>
                             <div class="text-end">
-                                <a href="{{ url_for('view_bill', bill_index=loop.index0) }}" class="btn btn-outline-primary btn-sm">
+                                <a href="{{ url_for('view_bill', bill_index=loop.index0) }}" class="btn btn-outline-primary btn-sm" title="View Bill">
                                     <i class="fas fa-eye me-1"></i>View
                                 </a>
-                                <a href="{{ url_for('download_bill', bill_index=loop.index0) }}" class="btn btn-outline-success btn-sm">
+                                <a href="{{ url_for('download_bill', bill_index=loop.index0) }}" class="btn btn-outline-success btn-sm" title="Download Bill">
                                     <i class="fas fa-download me-1"></i>Download
                                 </a>
+                                {% if can_edit %}
+                                <a href="{{ url_for('edit_bill', bill_id=bill.id) }}" class="btn btn-outline-warning btn-sm" title="Edit Bill">
+                                    <i class="fas fa-edit me-1"></i>Edit
+                                </a>
+                                {% endif %}
+                                {% if can_delete %}
+                                <button class="btn btn-outline-danger btn-sm" title="Delete Bill" data-bs-toggle="modal" data-bs-target="#deleteModal{{ bill.id }}">
+                                    <i class="fas fa-trash me-1"></i>Delete
+                                </button>
+                                <!-- Delete Confirmation Modal -->
+                                <div class="modal fade" id="deleteModal{{ bill.id }}" tabindex="-1" aria-labelledby="deleteModalLabel{{ bill.id }}" aria-hidden="true">
+                                  <div class="modal-dialog modal-dialog-centered">
+                                    <div class="modal-content">
+                                      <div class="modal-header">
+                                        <h5 class="modal-title" id="deleteModalLabel{{ bill.id }}">Confirm Delete</h5>
+                                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                                      </div>
+                                      <div class="modal-body">
+                                        Are you sure you want to delete bill <strong>{{ bill.bill_number }}</strong> for <strong>{{ bill.centre_name }}</strong>?
+                                      </div>
+                                      <div class="modal-footer">
+                                        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                                        <form method="post" action="{{ url_for('delete_bill', bill_id=bill.id) }}" style="display:inline;">
+                                            <button type="submit" class="btn btn-danger">Delete</button>
+                                        </form>
+                                      </div>
+                                    </div>
+                                  </div>
+                                </div>
+                                {% endif %}
                             </div>
                         </div>
                     </div>
@@ -224,19 +266,62 @@
                 <tbody>
                     {% for bill in bills %}
                     <tr>
-                        <td>{{ bill.centre_name if bill.centre_name else 'N/A' }}</td>
+                        <td>{{ bill.centre_name if bill.centre_name else 'N/A' }}
+                            {% if bill.status %}
+                            <span class="badge 
+                                {% if bill.status == 'paid' %}bg-success
+                                {% elif bill.status == 'pending' %}bg-warning text-dark
+                                {% elif bill.status == 'rejected' %}bg-danger
+                                {% elif bill.status == 'in_review' %}bg-info text-dark
+                                {% elif bill.status == 'cancelled' %}bg-secondary
+                                {% else %}bg-light text-dark
+                                {% endif %} ms-2">
+                                <i class="fas fa-circle me-1"></i>{{ bill.status|capitalize }}
+                            </span>
+                            {% endif %}
+                        </td>
                         <td>{{ bill.bill_number if bill.bill_number else 'N/A' }}</td>
                         <td>{{ bill.test_items|length if bill.test_items else 0 }}</td>
                         <td class="text-end">{{ "%.2f"|format(bill.total_mrp) if bill.total_mrp is defined else 0.00 }}</td>
                         <td class="text-end">{{ "%.2f"|format(bill.total_rate) if bill.total_rate is defined else 0.00 }}</td>
                         <td class="text-end">{{ "%.2f"|format(bill.total_sharing) if bill.total_sharing is defined else 0.00 }}</td>
                         <td>
-                            <a href="{{ url_for('view_bill', bill_index=loop.index0) }}" class="btn btn-outline-primary btn-sm">
+                            <a href="{{ url_for('view_bill', bill_index=loop.index0) }}" class="btn btn-outline-primary btn-sm" title="View Bill">
                                 <i class="fas fa-eye"></i>
                             </a>
-                            <a href="{{ url_for('download_bill', bill_index=loop.index0) }}" class="btn btn-outline-success btn-sm">
+                            <a href="{{ url_for('download_bill', bill_index=loop.index0) }}" class="btn btn-outline-success btn-sm" title="Download Bill">
                                 <i class="fas fa-download"></i>
                             </a>
+                            {% if can_edit %}
+                            <a href="{{ url_for('edit_bill', bill_id=bill.id) }}" class="btn btn-outline-warning btn-sm" title="Edit Bill">
+                                <i class="fas fa-edit"></i>
+                            </a>
+                            {% endif %}
+                            {% if can_delete %}
+                            <button class="btn btn-outline-danger btn-sm" title="Delete Bill" data-bs-toggle="modal" data-bs-target="#deleteModalTable{{ bill.id }}">
+                                <i class="fas fa-trash"></i>
+                            </button>
+                            <!-- Delete Confirmation Modal (Table) -->
+                            <div class="modal fade" id="deleteModalTable{{ bill.id }}" tabindex="-1" aria-labelledby="deleteModalTableLabel{{ bill.id }}" aria-hidden="true">
+                              <div class="modal-dialog modal-dialog-centered">
+                                <div class="modal-content">
+                                  <div class="modal-header">
+                                    <h5 class="modal-title" id="deleteModalTableLabel{{ bill.id }}">Confirm Delete</h5>
+                                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                                  </div>
+                                  <div class="modal-body">
+                                    Are you sure you want to delete bill <strong>{{ bill.bill_number }}</strong> for <strong>{{ bill.centre_name }}</strong>?
+                                  </div>
+                                  <div class="modal-footer">
+                                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                                    <form method="post" action="{{ url_for('delete_bill', bill_id=bill.id) }}" style="display:inline;">
+                                        <button type="submit" class="btn btn-danger">Delete</button>
+                                    </form>
+                                  </div>
+                                </div>
+                              </div>
+                            </div>
+                            {% endif %}
                         </td>
                     </tr>
                     {% endfor %}
@@ -353,4 +438,4 @@ document.addEventListener('DOMContentLoaded', function() {
     filterAndSortBills();
 });
 </script>
-{% endblock %} 
+{% endblock %}

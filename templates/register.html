@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Register - Medical Billing System{% endblock %}
+{% block content %}
+<div class="container mt-5" style="max-width: 500px;">
+    <div class="card text-center">
+        <img src="{{ url_for('static', filename='rpl-logo.png') }}" alt="Logo" style="height:60px; width:auto; margin: 30px auto 10px auto;">
+        <div class="card-header bg-primary text-white text-center d-flex flex-column align-items-center">
+            <div class="rounded-circle bg-light d-flex align-items-center justify-content-center mb-2" style="width:56px; height:56px; font-size:2rem; color:#3498db; border:2px solid #3498db;">
+                <i class="fas fa-user-plus"></i>
+            </div>
+            <h4 class="mb-0">Create Account</h4>
+        </div>
+        <div class="card-body">
+            <form method="post">
+                <div class="mb-3">
+                    <label for="username" class="form-label">Username</label>
+                    <input type="text" class="form-control" id="username" name="username" required>
+                </div>
+                <div class="mb-3">
+                    <label for="email" class="form-label">Email</label>
+                    <input type="email" class="form-control" id="email" name="email" required>
+                </div>
+                <div class="mb-3">
+                    <label for="password" class="form-label">Password</label>
+                    <input type="password" class="form-control" id="password" name="password" required>
+                </div>
+                <div class="mb-3">
+                    <label for="role" class="form-label">Role</label>
+                    <select class="form-select" id="role" name="role">
+                        <option value="staff">Staff</option>
+                        <option value="admin">Admin</option>
+                    </select>
+                </div>
+                <button type="submit" class="btn btn-primary w-100">Register</button>
+            </form>
+            <div class="text-center mt-3">
+                <a href="{{ url_for('login') }}">Already have an account? Login</a>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
