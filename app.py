@@ -15,7 +15,11 @@ from utils import AmountToWords, InvoiceNumberGenerator, AIIntegration, safe_flo
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
+# SQLAlchemy/PostgreSQL imports
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import func
 from openpyxl.cell import MergedCell
+
 # Load environment variables
 load_dotenv()
 
@@ -23,10 +27,85 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 app = Flask(__name__)
 app.secret_key = 'your-secret-key-here'
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+
+# SQLAlchemy/PostgreSQL config
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/billing_db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+# --- Database Models ---
+class BillCategory(db.Model):
+    __tablename__ = 'bill_categories'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(64), unique=True, nullable=False)
+    description = db.Column(db.String(256))
+    bills = db.relationship('Bill', backref='category', lazy=True)
+
+class UploadedFile(db.Model):
+    __tablename__ = 'uploaded_files'
+    id = db.Column(db.Integer, primary_key=True)
+    filename = db.Column(db.String(256), nullable=False)
+    upload_time = db.Column(db.DateTime, default=datetime.utcnow)
+    file_path = db.Column(db.String(512), nullable=False)
+    bills = db.relationship('Bill', backref='uploaded_file', lazy=True)
+
+class Bill(db.Model):
+    __tablename__ = 'bills'
+    id = db.Column(db.Integer, primary_key=True)
+    bill_number = db.Column(db.String(64), unique=True, nullable=False)
+    center_name = db.Column(db.String(128), nullable=False)
+    month = db.Column(db.String(16), nullable=False)  # e.g. '2025-08'
+    category_id = db.Column(db.Integer, db.ForeignKey('bill_categories.id'), nullable=False)
+    uploaded_file_id = db.Column(db.Integer, db.ForeignKey('uploaded_files.id'), nullable=True)
+    bill_data = db.Column(db.JSON, nullable=False)  # Store bill details as JSON
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f'<Bill {self.bill_number} - {self.center_name}>'
+from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for, flash
+import pandas as pd
+import os
+from datetime import datetime
+import json
+from werkzeug.utils import secure_filename
+import tempfile
+import zipfile
+from io import BytesIO
+import logging
+import requests
+from dotenv import load_dotenv
+import re
+from utils import AmountToWords, InvoiceNumberGenerator, AIIntegration, safe_float_conversion, safe_int_conversion, safe_date_conversion
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+# SQLAlchemy/PostgreSQL imports
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import func
+from openpyxl.cell import MergedCell
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+app = Flask(__name__)
+app.secret_key = 'your-secret-key-here'
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+
+# SQLAlchemy/PostgreSQL config
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/billing_db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
 
 # Ensure upload folder exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -325,6 +404,10 @@ def upload_file():
         if df is None or df.empty:
             flash('No bills could be generated from the uploaded file', 'error')
             return redirect(url_for('index'))
+        # Store uploaded file info in DB
+        uploaded_file = UploadedFile(filename=filename, file_path=file_path)
+        db.session.add(uploaded_file)
+        db.session.commit()
         app.df = df
         flash(f'Successfully uploaded {filename}', 'success')
         return redirect(url_for('index'))
@@ -514,6 +597,14 @@ def generate_b2b_bills():
         df = app.df.copy()
         b2b_df = df[df['MobileNumber'].astype(str).str.strip().str.upper() == 'B2B']
         bills = []
+        month_str = datetime.now().strftime('%Y-%m')
+        # Ensure B2B category exists
+        category = BillCategory.query.filter_by(name='B2B').first()
+        if not category:
+            category = BillCategory(name='B2B', description='B2B Centers')
+            db.session.add(category)
+            db.session.commit()
+        uploaded_file = UploadedFile.query.order_by(UploadedFile.id.desc()).first()
         for center_name, group in b2b_df.groupby('CENTER NAME'):
             if pd.isna(center_name) or center_name == '':
                 continue
@@ -540,7 +631,7 @@ def generate_b2b_bills():
                 total_rate += rate
                 total_sharing += sharing_amount
             invoice_number = invoice_generator.generate(center_type='B2B', center_name=str(center_name))
-            bill = {
+            bill_data = {
                 'centre_name': str(center_name),
                 'test_items': test_items,
                 'total_mrp': total_mrp,
@@ -551,7 +642,18 @@ def generate_b2b_bills():
                 'center_type': 'B2B',
                 'amount_in_words': amount_converter.convert(total_rate)
             }
-            bills.append(bill)
+            # Store bill in DB
+            bill_db = Bill(
+                bill_number=invoice_number,
+                center_name=str(center_name),
+                month=month_str,
+                category_id=category.id,
+                uploaded_file_id=uploaded_file.id if uploaded_file else None,
+                bill_data=bill_data
+            )
+            db.session.add(bill_db)
+            bills.append(bill_data)
+        db.session.commit()
         if not bills:
             flash('No B2B bills found in the uploaded data', 'error')
             return redirect(url_for('bills'))
@@ -563,21 +665,33 @@ def generate_b2b_bills():
         flash('An error occurred while processing B2B bill generation', 'error')
         return redirect(url_for('bills'))
 
+
+# --- New: Bills listing with DB filtering ---
 @app.route('/bills')
 def bills():
     try:
-        if not hasattr(app, 'bills') or not app.bills:
-            flash('No bills available. Please upload an Excel file first.', 'error')
+        # Get filter params
+        month = request.args.get('month')
+        category_name = request.args.get('category')
+        query = Bill.query
+        if month:
+            query = query.filter(Bill.month == month)
+        if category_name:
+            category = BillCategory.query.filter_by(name=category_name).first()
+            if category:
+                query = query.filter(Bill.category_id == category.id)
+        bills_db = query.order_by(Bill.created_at.desc()).all()
+        bills = [b.bill_data for b in bills_db]
+        if not bills:
+            flash('No bills available for the selected filter.', 'error')
             return redirect(url_for('index'))
-        
-        # Calculate total tests and amounts
-        total_tests = sum(len(bill['test_items']) for bill in app.bills)
-        total_mrp = sum(bill['total_mrp'] for bill in app.bills)
-        total_rate = sum(bill['total_rate'] for bill in app.bills)
-        total_sharing = sum(bill['total_sharing'] for bill in app.bills)
-        
-        return render_template('bills.html', 
-                             bills=app.bills, 
+        # Calculate totals
+        total_tests = sum(len(b['test_items']) for b in bills)
+        total_mrp = sum(b.get('total_mrp', 0) for b in bills)
+        total_rate = sum(b.get('total_rate', 0) for b in bills)
+        total_sharing = sum(b.get('total_sharing', 0) for b in bills)
+        return render_template('bills.html',
+                             bills=bills,
                              total_tests=total_tests,
                              total_mrp=total_mrp,
                              total_rate=total_rate,
@@ -587,6 +701,26 @@ def bills():
         logger.error(f"Error in bills route: {e}")
         flash('An error occurred while loading bills', 'error')
         return redirect(url_for('index'))
+
+# --- New: API endpoint for bills by month/category ---
+@app.route('/api/bills/filter')
+def api_bills_filter():
+    try:
+        month = request.args.get('month')
+        category_name = request.args.get('category')
+        query = Bill.query
+        if month:
+            query = query.filter(Bill.month == month)
+        if category_name:
+            category = BillCategory.query.filter_by(name=category_name).first()
+            if category:
+                query = query.filter(Bill.category_id == category.id)
+        bills_db = query.order_by(Bill.created_at.desc()).all()
+        bills = [b.bill_data for b in bills_db]
+        return jsonify({'bills': bills, 'count': len(bills)})
+    except Exception as e:
+        logger.error(f"Error in api_bills_filter: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/bill/<int:bill_index>')
 def view_bill(bill_index):

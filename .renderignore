@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+*.db
+*.sqlite3
+uploads/
+hlm_bills/
+bills/
+*.xlsm
+*.xlsx
+*.log

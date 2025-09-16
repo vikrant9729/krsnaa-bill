@@ -7,3 +7,5 @@ openpyxl
 pdfkit
 xhtml2pdf
 gunicorn
+flask_sqlalchemy
+psycopg2-binary
