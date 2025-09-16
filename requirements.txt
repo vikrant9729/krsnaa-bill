@@ -1,0 +1,9 @@
+flask
+pandas
+python-dotenv
+werkzeug
+requests
+openpyxl
+pdfkit
+xhtml2pdf
+gunicorn

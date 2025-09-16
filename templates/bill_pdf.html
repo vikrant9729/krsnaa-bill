@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>{{ bill.bill_number }} - Tax Invoice</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            color: #333;
+        }
+        .header {
+            display: flex;
+            align-items: center;
+            border-bottom: 3px solid #2c3e50;
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+        }
+        .header img {
+            height: 50px;
+            margin-left: 15px;
+            text-align: right;
+        }
+        .brand-text {
+            line-height: 1.3;
+        }
+        .tax-title {
+            font-size: 20px;
+            font-weight: bold;
+            text-align: center;
+        }
+        .brand-name {
+            font-size: 18px;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        .bill-info {
+            margin-bottom: 20px;
+        }
+        .tests-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+        .tests-table th, .tests-table td {
+            border: 1px solid #ccc;
+            padding: 6px;
+            text-align: center;
+        }
+        .tests-table th {
+            background: #f4f4f4;
+        }
+        .footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            border-top: 2px solid #ddd;
+            padding-top: 20px;
+            margin-top: 30px;
+            font-size: 14px;
+        }
+        .bank-details {
+            flex: 1;
+        }
+        .signature-section {
+            text-align: right;
+            flex: 1;
+        }
+        .signature-line {
+            border-top: 1px solid #333;
+            margin-top: 40px;
+            width: 200px;
+            display: inline-block;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- ================= SUMMARY PAGE ================= -->
+    <div class="header">
+        <img src="{{ request.url_root }}static/logo.png" alt="Logo">
+        <div class="brand-text">
+            <div class="tax-title">TAX INVOICE</div>
+            <div class="brand-name">KRSNAA RETAIL PVT LTD</div>
+            <div class="subtle">243/A, HNo. 6, CTSNo 4519, Near Chinchwad Station, Pune</div>
+            <div class="subtle">PAN: AAKCK9446R | GST: 27AAKCK9446R1ZF</div>
+        </div>
+    </div>
+
+    <div class="bill-info">
+        <p><strong>Bill Number:</strong> {{ bill.bill_number }}<br>
+           <strong>Bill Date:</strong> {{ bill.bill_date }}<br>
+          </p>
+    </div>
+    <div class="bill-info">
+        <table>
+            <tr>
+                <td><strong>Center Name:</strong> {{ bill.centre_name }}</td>
+                <td><strong>Bill Type:</strong> {{ bill.center_type }}</td>
+            </tr>
+            <tr>
+                <td><strong>Total Patients:</strong> {{ bill.test_items | map(attribute='visit_code') | unique | list | length }}</td>
+                <td><strong>Total Tests:</strong> {{ bill.test_items|length }}</td>
+            </tr>
+            <tr>
+                <td></td>
+                {% if bill.center_type != "B2B" %}
+                <td><strong>MRP Total:</strong> Rs. {{ "%.2f"|format(bill.total_mrp) }}</td>
+                <td><strong>Sharing Total:</strong> Rs. {{ "%.2f"|format(bill.total_sharing) }}</td>
+                <td><strong>Rate Total:</strong> Rs. {{ "%.2f"|format(bill.total_rate) }}</td>
+                {% endif %} 
+            </tr>
+        </table>    
+    </div>
+
+    <!-- Totals Summary -->
+    <table class="tests-table">
+        <thead>
+            <tr>
+                <th>PARTICULARS</th>
+                {% if bill.center_type == "B2B" %}
+                    <th>BILL AMOUNT</th>
+                {% else %}
+                    <th>MRP</th>
+                    <th>Total Sharing</th>
+                    <th>NET AMOUNT</th>
+                {% endif %}
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Pathology Investigation</td>
+                {% if bill.center_type == "B2B" %}
+                <td>Rs. {{ "%.2f"|format(bill.total_rate) }}</td>
+            {% else %}
+                <td>Rs. {{ "%.2f"|format(bill.total_mrp) }}</td>
+                <td>Rs. {{ "%.2f"|format(bill.total_sharing) }}</td>
+                <td>Rs. {{ "%.2f"|format(bill.total_rate) }}</td>
+            {% endif %}
+        </tr>
+    </tbody>
+</table>
+
+    <!-- Footer for Summary -->
+     <BR>
+     <BR>
+     <BR>
+     <BR>
+    <div class="footer">
+        <div class="bank-details">
+            <strong>Bank Details:</strong><br>
+            Bank Name: HDFC Bank<br>
+            Account No: 50200108076759<br>
+            IFSC Code: HDFC0000437<br>
+            Account Type: Current Account
+            <p style="margin-top:10px;">
+                <strong>Statutory Notes:</strong><br>
+                This invoice is exempt from GST as per Notification No. 12/2017-Central Tax (Rate)<br>
+                TDS @ 2% u/s 194J of Income Tax Act, 1961 is applicable
+            </p>
+        </div>
+        <div class="signature-section">
+            <div class="signature-line">
+                <p style="margin-top:10px;">
+                    <strong>Authorised Signatory  </strong><br>
+                    
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Force New Page -->
+    <div style="page-break-before: always;"></div>
+
+    <!-- ================= DETAILED PAGE ================= -->
+    <h3 style="text-align:center;">Detailed Test List</h3>
+    <table class="tests-table">
+        <thead>
+            <tr>
+                <th>Sr.No.</th>
+                <th>Registered Date</th>
+                <th>Visit Code</th>
+                <th>Patient Name</th>
+                <th>Test Name</th>
+                <th>MRP</th>
+                <th>Rate</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for item in bill.test_items %}
+            <tr>
+                <td>{{ loop.index }}</td>
+                <td>{{ item.registered_date }}</td>
+                <td>{{ item.visit_code }}</td>
+                <td>{{ item.patient_name }}</td>
+                <td>{{ item.test_name }}</td>
+                <td>Rs. {{ "%.2f"|format(item.mrp) }}</td>
+                <td>Rs. {{ "%.2f"|format(item.rate) }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+        <tfoot>
+            <tr class="total-row">
+                <td colspan="{% if bill.center_type != 'B2B' %}6{% else %}5{% endif %}">TOTAL</td>
+                <td>Rs. {{ "%.2f"|format(bill.total_mrp) }}</td>
+                <td>Rs. {{ "%.2f"|format(bill.total_rate) }}</td>
+                {% if bill.center_type != "B2B" %}
+                <td>Rs. {{ "%.2f"|format(bill.total_sharing) }}</td>
+                {% endif %}
+            </tr>
+        </tfoot>
+    </table>
+
+</body>
+</html>
